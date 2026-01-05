@@ -5,13 +5,16 @@ import torch
 import torch.sparse
 import torch.autograd.function
 
-from .utils import (
-    CUDATimer,
+from .utils.time import CUDATimer
+from .utils.ops import (
     sort_topk_result,
     build_sparse_csr_from_topk,
     build_sparse_coo_from_topk,
 )
-from .kernel import masked_matmul, masked_matmul_with_col_sum
+from .kernel import (
+    masked_matmul,
+    masked_matmul_with_col_sum,
+)
 
 
 def topk_sae(
@@ -20,7 +23,7 @@ def topk_sae(
     b_E: torch.Tensor,  # [d_sae]
     W_D: torch.Tensor,  # [d_sae, d_model]
     b_D: torch.Tensor,  # [d_model]
-    k: int,
+    topk: int,
     times: dict[str, float] = {},
     enable_timer: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -28,9 +31,9 @@ def topk_sae(
         hidden_pre = activations @ W_E + b_E  # [batch_size, d_sae]
 
     with CUDATimer(times, "fwd_topk", enable=enable_timer):
-        topk_values, topk_indices = torch.topk(hidden_pre, k=k, dim=-1, sorted=False)
+        topk_values, topk_indices = torch.topk(hidden_pre, k=topk, dim=-1, sorted=False)
         feature_acts = torch.zeros_like(hidden_pre)
-        _ = feature_acts.scatter_(dim=1, index=topk_indices, src=topk_values)
+        feature_acts.scatter_(dim=1, index=topk_indices, src=topk_values)
 
     with CUDATimer(times, "fwd_decode", enable=enable_timer):
         reconstruct = feature_acts @ W_D + b_D
@@ -44,7 +47,7 @@ def topk_sae_fwd_sparse(
     b_E: torch.Tensor,
     W_D: torch.Tensor,
     b_D: torch.Tensor,
-    k: int,
+    topk: int,
     times: dict[str, float] = {},
     *,
     sparse_format: Literal["csr", "coo"] = "csr",
@@ -54,7 +57,7 @@ def topk_sae_fwd_sparse(
         hidden_pre = activations @ W_E + b_E
 
     with CUDATimer(times, "fwd_topk", enable=enable_timer):
-        topk_values, topk_indices = torch.topk(hidden_pre, k=k, dim=-1, sorted=False)
+        topk_values, topk_indices = torch.topk(hidden_pre, k=topk, dim=-1, sorted=False)
 
     with CUDATimer(times, "fwd_build_feature_acts", enable=enable_timer):
         feature_acts = torch.zeros_like(hidden_pre)
@@ -82,7 +85,7 @@ def topk_sae_fwd_sparse_fused(
     b_E: torch.Tensor,
     W_D: torch.Tensor,
     b_D: torch.Tensor,
-    k: int,
+    topk: int,
     times: dict[str, float] = {},
     *,
     sparse_format: Literal["csr", "coo"] = "csr",
@@ -94,7 +97,7 @@ def topk_sae_fwd_sparse_fused(
         hidden_pre = activations @ W_E + b_E
 
     with CUDATimer(times, "fwd_topk", enable=enable_timer):
-        topk_values, topk_indices = torch.topk(hidden_pre, k=k, dim=-1, sorted=False)
+        topk_values, topk_indices = torch.topk(hidden_pre, k=topk, dim=-1, sorted=False)
 
     with CUDATimer(times, "fwd_sort_topk_result", enable=enable_timer):
         topk_indices_sorted, topk_values_sorted = sort_topk_result(
@@ -123,6 +126,7 @@ topk_sae_fwd_sparse_csr_fused = partial(topk_sae_fwd_sparse_fused, sparse_format
 
 class TopKSparseFusedSAE(torch.autograd.Function):
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(
         ctx,
         activations: torch.Tensor,
@@ -130,11 +134,10 @@ class TopKSparseFusedSAE(torch.autograd.Function):
         b_E: torch.Tensor,
         W_D: torch.Tensor,
         b_D: torch.Tensor,
-        k: int,
+        topk: int,
         times: dict[str, float] = {},
         enable_timer: bool = True,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        batch_size = activations.shape[0]
         d_sae = W_E.shape[1]
 
         with CUDATimer(times, "fwd_encode", enable=enable_timer):
@@ -142,7 +145,7 @@ class TopKSparseFusedSAE(torch.autograd.Function):
 
         with CUDATimer(times, "fwd_topk", enable=enable_timer):
             topk_values, topk_indices = torch.topk(
-                hidden_pre, k=k, dim=-1, sorted=False
+                hidden_pre, k=topk, dim=-1, sorted=False
             )
 
         with CUDATimer(times, "fwd_sort_topk_result", enable=enable_timer):
@@ -168,13 +171,14 @@ class TopKSparseFusedSAE(torch.autograd.Function):
             topk_indices_sorted,
             topk_values_sorted,
         )
-        ctx.k = k
+        ctx.topk = topk
         ctx.times = times
         ctx.enable_timer = enable_timer
 
         return reconstruct, times
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(
         ctx,
         grad_output: torch.Tensor,
@@ -199,7 +203,7 @@ class TopKSparseFusedSAE(torch.autograd.Function):
             topk_indices_sorted,
             topk_values_sorted,
         ) = ctx.saved_tensors
-        k = ctx.k
+        topk = ctx.topk
         times = ctx.times
         enable_timer = ctx.enable_timer
 
@@ -229,8 +233,8 @@ class TopKSparseFusedSAE(torch.autograd.Function):
         with CUDATimer(times, "bwd_grad_hidden_pre", enable=enable_timer):
             crow_indices = torch.arange(
                 0,
-                (batch_size + 1) * k,
-                k,
+                (batch_size + 1) * topk,
+                topk,
                 device=grad_topk_values.device,
                 dtype=torch.int32,
             )
@@ -259,10 +263,10 @@ def topk_sae_sparse_fused(
     b_E: torch.Tensor,
     W_D: torch.Tensor,
     b_D: torch.Tensor,
-    k: int,
+    topk: int,
     times: dict[str, float] = {},
     enable_timer: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     return TopKSparseFusedSAE.apply(
-        activations, W_E, b_E, W_D, b_D, k, times, enable_timer
+        activations, W_E, b_E, W_D, b_D, topk, times, enable_timer
     )
