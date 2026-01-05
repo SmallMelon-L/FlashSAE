@@ -5,7 +5,11 @@ import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.nn.functional as F
 
-from .kernel import flash_attn_func, masked_matmul, triton_sparse_dense_matmul
+from .kernel import (
+    masked_matmul,
+    flash_attn_forward,
+    flash_attn_backward,
+)
 from .utils.time import CUDATimer
 from .utils.ops import (
     sort_topk_result,
@@ -177,8 +181,6 @@ def topk_lorsa_custom_flash(
     times: dict[str, float] = {},
     enable_timer: bool = True,
 ) -> torch.Tensor:
-    d_sae = W_O.shape[0]
-
     with CUDATimer(times, "fwd_compute_qkv", enable=enable_timer):
         q, k, v = _compute_qkv(activations, W_Q, b_Q, W_K, b_K, W_V, b_V)
         value = v.reshape(*k.shape[:3], -1)  # (batch, seq_len, n_qk_heads, d_v_head)
@@ -340,3 +342,51 @@ class TopKSparseFusedDecode(torch.autograd.Function):
 
 
 topk_decode_sparse_fused = TopKSparseFusedDecode.apply
+
+
+class FlashAttnFunc(torch.autograd.Function):
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
+    def forward(ctx, q, k, v, causal=False, softmax_scale=None):
+        """
+        q: (batch_size, seqlen_q, nheads, headdim)
+        k: (batch_size, seqlen_k, nheads, headdim)
+        v: (batch_size, seqlen_k, nheads, headdim_v)  # headdim_v can be different from headdim
+        Returns: (batch_size, seqlen_q, nheads, headdim_v)
+        """
+        # Make sure that the last dimension is contiguous
+        q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
+        o, lse, ctx.softmax_scale = flash_attn_forward(
+            q, k, v, causal=causal, softmax_scale=softmax_scale
+        )
+        ctx.save_for_backward(q, k, v, o, lse)
+        ctx.causal = causal
+        return o
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx, do):
+        q, k, v, o, lse = ctx.saved_tensors
+        # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
+        # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
+        with torch.inference_mode():
+            dq = torch.empty_like(q)
+            dk = torch.empty_like(k)
+            dv = torch.empty_like(v)
+            flash_attn_backward(
+                do,  # [batch_size, seq_len_q, n_heads, headdim_v]
+                q,
+                k,
+                v,
+                o,
+                lse,
+                dq,
+                dk,
+                dv,
+                causal=ctx.causal,
+                softmax_scale=ctx.softmax_scale,
+            )
+        return dq, dk, dv, None, None, None
+
+
+flash_attn_func = FlashAttnFunc.apply
